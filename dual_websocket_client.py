@@ -41,7 +41,7 @@ import aiohttp
 import asyncpg
 import websockets
 from dotenv import load_dotenv
-from websockets.client import WebSocketClientProtocol
+from websockets.legacy.client import WebSocketClientProtocol
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +273,11 @@ class ReconnectingWebSocketClient:
 
 
 class CapitalComClient(ReconnectingWebSocketClient):
-    BASE_REST_URL = "https://api-capital.com/api"
-    STREAMING_URL = "wss://api-streaming-capital.com/connect"
+
+    DEFAULT_REST_URL = "https://api-capital.com/api"
+    DEFAULT_STREAMING_URL = "wss://api-streaming-capital.com/connect"
+    DEMO_REST_URL = "https://demo-api-capital.com/api"
+    DEMO_STREAMING_URL = "wss://demo-streaming-capital.com/connect"
 
     def __init__(
         self,
@@ -283,6 +286,8 @@ class CapitalComClient(ReconnectingWebSocketClient):
         email: str,
         password: str,
         db_pool: asyncpg.Pool,
+        rest_url: Optional[str] = None,
+        streaming_url: Optional[str] = None,
     ) -> None:
         super().__init__(name="Capital.com")
         self._mappings = list(mappings)
@@ -293,6 +298,11 @@ class CapitalComClient(ReconnectingWebSocketClient):
         self._cst: Optional[str] = None
         self._security_token: Optional[str] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
+        self._auth_lock = asyncio.Lock()
+        self._token_expiry: float = 0.0
+        self._rest_url = (rest_url or self.DEFAULT_REST_URL).rstrip("/")
+        self._streaming_url = (streaming_url or self.DEFAULT_STREAMING_URL).rstrip("/")
+        self._allow_demo_fallback = rest_url is None and streaming_url is None
 
     async def stop(self) -> None:
         await super().stop()
@@ -306,26 +316,80 @@ class CapitalComClient(ReconnectingWebSocketClient):
             "X-SECURITY-TOKEN": self._security_token or "",
         }
         LOGGER.debug("Capital.com connecting with headers: %s", headers.keys())
-        return await websockets.connect(self.STREAMING_URL, extra_headers=headers, ping_interval=20, ping_timeout=20)
+        return await websockets.connect(
+            self._streaming_url,
+            extra_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        )
 
     async def _authenticate(self) -> None:
-        if self._http_session is None:
-            self._http_session = aiohttp.ClientSession()
+        async with self._auth_lock:
+            if self._tokens_are_valid():
+                return
 
-        auth_url = f"{self.BASE_REST_URL}/v1/session"
-        headers = {"X-CAP-API-KEY": self._api_key, "Content-Type": "application/json"}
-        payload = {"identifier": self._email, "password": self._password}
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = aiohttp.ClientSession()
 
-        async with self._http_session.post(auth_url, headers=headers, json=payload, timeout=30) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"Capital.com authentication failed ({resp.status}): {text}")
-            data = await resp.json()
-            self._cst = resp.headers.get("CST") or data.get("CST")
-            self._security_token = resp.headers.get("X-SECURITY-TOKEN") or data.get("securityToken")
+            attempt_urls = [(self._rest_url, self._streaming_url)]
+            if self._allow_demo_fallback and self._rest_url == self.DEFAULT_REST_URL:
+                attempt_urls.append((self.DEMO_REST_URL, self.DEMO_STREAMING_URL))
 
-        if not self._cst or not self._security_token:
-            raise RuntimeError("Missing CST or X-SECURITY-TOKEN after authentication")
+            last_error: Optional[str] = None
+            for rest_url, streaming_url in attempt_urls:
+                auth_url = f"{rest_url}/v1/session"
+                headers = {
+                    "X-CAP-API-KEY": self._api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json; charset=UTF-8",
+                    "Version": "1",
+                }
+                payload = {"identifier": self._email, "password": self._password}
+
+                try:
+                    async with self._http_session.post(
+                        auth_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=30,
+                    ) as resp:
+                        text_body = await resp.text()
+                        if resp.status != 200:
+                            last_error = f"Capital.com authentication failed ({resp.status}): {text_body.strip()}"
+                            LOGGER.error("%s", last_error)
+                            if resp.status == 405:
+                                LOGGER.warning(
+                                    "Capital.com login rejected with 405 at %s; verify environment or credentials",
+                                    rest_url,
+                                )
+                            continue
+                        try:
+                            data = json.loads(text_body) if text_body else {}
+                        except json.JSONDecodeError:
+                            data = {}
+
+                        self._cst = resp.headers.get("CST") or data.get("CST")
+                        self._security_token = resp.headers.get("X-SECURITY-TOKEN") or data.get("securityToken")
+                        if not self._cst or not self._security_token:
+                            last_error = (
+                                "Capital.com authentication missing CST or X-SECURITY-TOKEN from response"
+                            )
+                            LOGGER.error("%s", last_error)
+                            self._cst = None
+                            self._security_token = None
+                            continue
+                        self._rest_url = rest_url.rstrip("/")
+                        self._streaming_url = streaming_url.rstrip("/")
+                        self._update_token_expiry(data)
+                        LOGGER.info("Capital.com authenticated against %s", rest_url)
+                        break
+                except aiohttp.ClientError as exc:
+                    last_error = f"Capital.com authentication network error: {exc}"
+                    LOGGER.error("%s", last_error)
+                    continue
+
+            if not self._tokens_are_valid():
+                raise RuntimeError(last_error or "Capital.com authentication failed")
 
     async def _send_subscription(self, ws: WebSocketClientProtocol) -> None:
         if not websocket_is_open(ws):
@@ -410,6 +474,37 @@ class CapitalComClient(ReconnectingWebSocketClient):
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.exception("Capital.com failed to insert record: %s", exc)
+
+    def _tokens_are_valid(self) -> bool:
+        if not self._cst or not self._security_token:
+            return False
+        if self._token_expiry <= 0:
+            return False
+        return time.monotonic() < self._token_expiry
+
+    def _update_token_expiry(self, payload: Dict[str, Any]) -> None:
+        expiry_seconds: Optional[float] = None
+        expiry_epoch = payload.get("expiryTime") or payload.get("timeUntilExpiry")
+        if isinstance(expiry_epoch, (int, float)):
+            now_epoch = time.time()
+            if expiry_epoch > 1e12:  # milliseconds
+                expiry_seconds = (expiry_epoch / 1000) - now_epoch
+            elif expiry_epoch > 1e9:  # seconds timestamp
+                expiry_seconds = expiry_epoch - now_epoch
+            else:
+                expiry_seconds = float(expiry_epoch)
+        elif isinstance(expiry_epoch, str):
+            try:
+                expiry_seconds = float(expiry_epoch)
+            except ValueError:
+                expiry_seconds = None
+
+        if not expiry_seconds or expiry_seconds <= 0:
+            expiry_seconds = 55 * 60  # default to 55 minutes
+
+        self._token_expiry = time.monotonic() + expiry_seconds
+        ttl = max(0.0, self._token_expiry - time.monotonic())
+        LOGGER.debug("Capital.com session token valid for %.0f seconds", ttl)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +730,13 @@ async def graceful_shutdown(clients: Iterable[ReconnectingWebSocketClient], db: 
         await db.close()
 
 
-def read_env() -> Tuple[List[SymbolMapping], Dict[str, Any], Dict[str, Any], Dict[str, str]]:
+def read_env() -> Tuple[
+    List[SymbolMapping],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, str],
+    Dict[str, Optional[str]],
+]:
     load_dotenv()
 
     symbol_mappings = parse_symbol_mappings(os.environ.get("SYMBOLS", ""))
@@ -674,11 +775,16 @@ def read_env() -> Tuple[List[SymbolMapping], Dict[str, Any], Dict[str, Any], Dic
         if not value:
             raise RuntimeError(f"Missing required credential: {key}")
 
-    return symbol_mappings, capital_cfg, eod_cfg, provider_credentials
+    capital_urls = {
+        "rest": os.environ.get("CAPITAL_REST_BASE"),
+        "streaming": os.environ.get("CAPITAL_STREAMING_URL"),
+    }
+
+    return symbol_mappings, capital_cfg, eod_cfg, provider_credentials, capital_urls
 
 
 async def main() -> None:
-    symbol_mappings, capital_db_cfg, eod_db_cfg, credentials = read_env()
+    symbol_mappings, capital_db_cfg, eod_db_cfg, credentials, capital_urls = read_env()
 
     db_manager = DatabaseManager(capital_db_cfg, eod_db_cfg)
     await db_manager.start()
@@ -689,6 +795,8 @@ async def main() -> None:
         email=credentials["capital_email"],
         password=credentials["capital_password"],
         db_pool=db_manager.capital_pool,
+        rest_url=capital_urls.get("rest"),
+        streaming_url=capital_urls.get("streaming"),
     )
 
     eod_client = EODHDClient(
