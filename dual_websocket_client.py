@@ -96,6 +96,13 @@ def parse_symbol_mappings(raw: str) -> List[SymbolMapping]:
     return mappings
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -288,6 +295,8 @@ class CapitalComClient(ReconnectingWebSocketClient):
         db_pool: asyncpg.Pool,
         rest_url: Optional[str] = None,
         streaming_url: Optional[str] = None,
+        *,
+        allow_demo_fallback: bool = False,
     ) -> None:
         super().__init__(name="Capital.com")
         self._mappings = list(mappings)
@@ -302,7 +311,9 @@ class CapitalComClient(ReconnectingWebSocketClient):
         self._token_expiry: float = 0.0
         self._rest_url = (rest_url or self.DEFAULT_REST_URL).rstrip("/")
         self._streaming_url = (streaming_url or self.DEFAULT_STREAMING_URL).rstrip("/")
-        self._allow_demo_fallback = rest_url is None and streaming_url is None
+        self._allow_demo_fallback = allow_demo_fallback and rest_url is None and streaming_url is None
+        if self._allow_demo_fallback:
+            LOGGER.info("Capital.com demo fallback enabled via configuration")
 
     async def stop(self) -> None:
         await super().stop()
@@ -336,7 +347,11 @@ class CapitalComClient(ReconnectingWebSocketClient):
                 attempt_urls.append((self.DEMO_REST_URL, self.DEMO_STREAMING_URL))
 
             last_error: Optional[str] = None
-            for rest_url, streaming_url in attempt_urls:
+            for idx, (rest_url, streaming_url) in enumerate(attempt_urls):
+                if idx > 0:
+                    LOGGER.warning(
+                        "Capital.com primary authentication failed; retrying against demo endpoints"
+                    )
                 auth_url = f"{rest_url}/v1/session"
                 headers = {
                     "X-CAP-API-KEY": self._api_key,
@@ -778,6 +793,7 @@ def read_env() -> Tuple[
     capital_urls = {
         "rest": os.environ.get("CAPITAL_REST_BASE"),
         "streaming": os.environ.get("CAPITAL_STREAMING_URL"),
+        "allow_demo_fallback": env_flag("CAPITAL_ENABLE_DEMO_FALLBACK", False),
     }
 
     return symbol_mappings, capital_cfg, eod_cfg, provider_credentials, capital_urls
@@ -797,6 +813,7 @@ async def main() -> None:
         db_pool=db_manager.capital_pool,
         rest_url=capital_urls.get("rest"),
         streaming_url=capital_urls.get("streaming"),
+        allow_demo_fallback=capital_urls.get("allow_demo_fallback", False),
     )
 
     eod_client = EODHDClient(
