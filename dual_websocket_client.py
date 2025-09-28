@@ -188,8 +188,8 @@ class ReconnectingWebSocketClient:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._ws and not self._ws.closed:
-            await self._ws.close(code=1000, reason="shutdown")
+        if websocket_is_open(self._ws):
+            await close_websocket(self._ws, code=1000, reason="shutdown")
         if self._watchdog_task:
             self._watchdog_task.cancel()
 
@@ -240,7 +240,7 @@ class ReconnectingWebSocketClient:
                         timeout,
                     )
                     try:
-                        await ws.close(code=4000, reason="inactivity")
+                        await close_websocket(ws, code=4000, reason="inactivity")
                     finally:
                         return
         except asyncio.CancelledError:
@@ -254,8 +254,8 @@ class ReconnectingWebSocketClient:
         try:
             yield ws
         finally:
-            if ws and not ws.closed:
-                await ws.close()
+            if websocket_is_open(ws):
+                await close_websocket(ws)
 
     async def _connect(self) -> WebSocketClientProtocol:
         raise NotImplementedError
@@ -328,7 +328,7 @@ class CapitalComClient(ReconnectingWebSocketClient):
             raise RuntimeError("Missing CST or X-SECURITY-TOKEN after authentication")
 
     async def _send_subscription(self, ws: WebSocketClientProtocol) -> None:
-        if not ws.open:
+        if not websocket_is_open(ws):
             raise RuntimeError("Capital.com WebSocket not open during subscription")
         for mapping in self._mappings:
             subscribe_message = {
@@ -437,7 +437,7 @@ class EODHDClient(ReconnectingWebSocketClient):
         return await websockets.connect(url, ping_interval=20, ping_timeout=20)
 
     async def _send_subscription(self, ws: WebSocketClientProtocol) -> None:
-        if not ws.open:
+        if not websocket_is_open(ws):
             raise RuntimeError("EODHD WebSocket not open during subscription")
 
         symbols = ",".join(m.eodhd_ticker for m in self._mappings)
@@ -558,6 +558,71 @@ def _maybe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def websocket_is_open(ws: Optional[Any]) -> bool:
+    """Best-effort check that works across websockets versions."""
+
+    if ws is None:
+        return False
+
+    closed_attr = getattr(ws, "closed", None)
+    if isinstance(closed_attr, bool):
+        return not closed_attr
+    if callable(closed_attr):
+        try:
+            result = closed_attr()
+        except TypeError:
+            result = closed_attr
+        if isinstance(result, bool):
+            return not result
+        if hasattr(result, "done") and callable(result.done):  # asyncio Future
+            return not result.done()
+
+    open_attr = getattr(ws, "open", None)
+    if isinstance(open_attr, bool):
+        return open_attr
+    if callable(open_attr):
+        try:
+            result = open_attr()
+        except TypeError:
+            result = open_attr
+        if isinstance(result, bool):
+            return result
+
+    state_attr = getattr(ws, "state", None)
+    if state_attr is not None:
+        state_name = getattr(state_attr, "name", str(state_attr)).lower()
+        if "open" in state_name:
+            return True
+        if "closed" in state_name:
+            return False
+
+    ready_state = getattr(ws, "readyState", None)
+    if ready_state is not None:
+        try:
+            return int(ready_state) == 1
+        except (TypeError, ValueError):
+            pass
+
+    return True
+
+
+async def close_websocket(ws: Optional[Any], *, code: int = 1000, reason: str = "") -> None:
+    if ws is None:
+        return
+
+    close_callable = getattr(ws, "close", None)
+    if close_callable is None:
+        return
+
+    try:
+        result = close_callable(code=code, reason=reason)
+    except TypeError:
+        result = close_callable()
+
+    if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+        await result
 
 
 @asynccontextmanager
