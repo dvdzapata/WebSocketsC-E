@@ -281,7 +281,7 @@ class ReconnectingWebSocketClient:
 
 class CapitalComClient(ReconnectingWebSocketClient):
 
-    DEFAULT_REST_URL = "https://api-capital.com/api"
+    DEFAULT_REST_URL = "https://api-capital.backend-capital.com/api"
     DEFAULT_STREAMING_URL = "wss://api-streaming-capital.com/connect"
     DEMO_REST_URL = "https://demo-api-capital.com/api"
     DEMO_STREAMING_URL = "wss://demo-streaming-capital.com/connect"
@@ -353,55 +353,73 @@ class CapitalComClient(ReconnectingWebSocketClient):
                         "Capital.com primary authentication failed; retrying against demo endpoints"
                     )
                 auth_url = f"{rest_url}/v1/session"
-                headers = {
-                    "X-CAP-API-KEY": self._api_key,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json; charset=UTF-8",
-                    "Version": "1",
-                }
                 payload = {"identifier": self._email, "password": self._password}
+                header_variants = ("X-CAP-API-KEY", "X-IG-API-KEY")
 
-                try:
-                    async with self._http_session.post(
-                        auth_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=30,
-                    ) as resp:
-                        text_body = await resp.text()
-                        if resp.status != 200:
-                            last_error = f"Capital.com authentication failed ({resp.status}): {text_body.strip()}"
-                            LOGGER.error("%s", last_error)
-                            if resp.status == 405:
-                                LOGGER.warning(
-                                    "Capital.com login rejected with 405 at %s; verify environment or credentials",
-                                    rest_url,
+                for header_name in header_variants:
+                    headers = {
+                        header_name: self._api_key,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json; charset=UTF-8",
+                        "Version": "1",
+                        "Referer": "https://capital.com/",
+                    }
+
+                    try:
+                        async with self._http_session.post(
+                            auth_url,
+                            headers=headers,
+                            json=payload,
+                            timeout=30,
+                        ) as resp:
+                            text_body = await resp.text()
+                            if resp.status != 200:
+                                last_error = (
+                                    f"Capital.com authentication failed ({resp.status}) using {header_name}:"
+                                    f" {text_body.strip()}"
                                 )
-                            continue
-                        try:
-                            data = json.loads(text_body) if text_body else {}
-                        except json.JSONDecodeError:
-                            data = {}
+                                LOGGER.error("%s", last_error)
+                                if resp.status == 405:
+                                    LOGGER.warning(
+                                        "Capital.com login rejected with 405 at %s using %s; verify environment",
+                                        rest_url,
+                                        header_name,
+                                    )
+                                continue
+                            try:
+                                data = json.loads(text_body) if text_body else {}
+                            except json.JSONDecodeError:
+                                data = {}
 
-                        self._cst = resp.headers.get("CST") or data.get("CST")
-                        self._security_token = resp.headers.get("X-SECURITY-TOKEN") or data.get("securityToken")
-                        if not self._cst or not self._security_token:
-                            last_error = (
-                                "Capital.com authentication missing CST or X-SECURITY-TOKEN from response"
+                            self._cst = resp.headers.get("CST") or data.get("CST")
+                            self._security_token = resp.headers.get("X-SECURITY-TOKEN") or data.get(
+                                "securityToken"
                             )
-                            LOGGER.error("%s", last_error)
-                            self._cst = None
-                            self._security_token = None
-                            continue
-                        self._rest_url = rest_url.rstrip("/")
-                        self._streaming_url = streaming_url.rstrip("/")
-                        self._update_token_expiry(data)
-                        LOGGER.info("Capital.com authenticated against %s", rest_url)
-                        break
-                except aiohttp.ClientError as exc:
-                    last_error = f"Capital.com authentication network error: {exc}"
-                    LOGGER.error("%s", last_error)
+                            if not self._cst or not self._security_token:
+                                last_error = (
+                                    "Capital.com authentication missing CST or X-SECURITY-TOKEN from response"
+                                )
+                                LOGGER.error("%s", last_error)
+                                self._cst = None
+                                self._security_token = None
+                                continue
+                            self._rest_url = rest_url.rstrip("/")
+                            self._streaming_url = streaming_url.rstrip("/")
+                            self._update_token_expiry(data)
+                            LOGGER.info(
+                                "Capital.com authenticated against %s using %s header",
+                                rest_url,
+                                header_name,
+                            )
+                            break
+                    except aiohttp.ClientError as exc:
+                        last_error = f"Capital.com authentication network error: {exc}"
+                        LOGGER.error("%s", last_error)
+                        continue
+                else:
+                    # try next rest url
                     continue
+                break
 
             if not self._tokens_are_valid():
                 raise RuntimeError(last_error or "Capital.com authentication failed")
