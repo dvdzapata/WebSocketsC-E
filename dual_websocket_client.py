@@ -327,9 +327,9 @@ class CapitalComClient(ReconnectingWebSocketClient):
             "X-SECURITY-TOKEN": self._security_token or "",
         }
         LOGGER.debug("Capital.com connecting with headers: %s", headers.keys())
-        return await websockets.connect(
+        return await connect_websocket_compat(
             self._streaming_url,
-            extra_headers=headers,
+            headers,
             ping_interval=20,
             ping_timeout=20,
         )
@@ -686,6 +686,49 @@ def _maybe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+async def connect_websocket_compat(
+    url: str, headers: Dict[str, str], **kwargs: Any
+) -> Any:
+    """Connect to a websocket handling header parameter differences."""
+
+    header_items = [(k, v) for k, v in headers.items() if v is not None]
+    if not header_items:
+        header_items = list(headers.items())
+
+    connect_fn = _resolve_websocket_connect()
+    last_error: Optional[Exception] = None
+    for param in ("extra_headers", "additional_headers", "headers"):
+        call_kwargs = dict(kwargs)
+        call_kwargs[param] = header_items
+        try:
+            LOGGER.debug("Attempting websocket connect using %s parameter", param)
+            return await connect_fn(url, **call_kwargs)
+        except TypeError as exc:
+            LOGGER.debug("websocket connect rejected %s parameter: %s", param, exc)
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unable to negotiate websocket connection headers")
+
+
+def _resolve_websocket_connect() -> Any:
+    """Return the appropriate websockets connect coroutine for the environment."""
+
+    legacy_module = getattr(websockets, "legacy", None)
+    if legacy_module is not None:
+        client_mod = getattr(legacy_module, "client", None)
+        connect_fn = getattr(client_mod, "connect", None) if client_mod else None
+        if callable(connect_fn):
+            return connect_fn
+
+    connect_fn = getattr(websockets, "connect", None)
+    if not callable(connect_fn):
+        raise RuntimeError("websockets.connect callable not available")
+    return connect_fn
 
 
 def websocket_is_open(ws: Optional[Any]) -> bool:
