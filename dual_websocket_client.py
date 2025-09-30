@@ -207,6 +207,7 @@ class ReconnectingWebSocketClient:
             self._last_message_ts = time.monotonic()
             LOGGER.info("%s connection established", self.name)
 
+            await self._after_connect(ws)
             await self._send_subscription(ws)
             self._subscription_sent = True
             LOGGER.info("%s subscription sent", self.name)
@@ -216,6 +217,7 @@ class ReconnectingWebSocketClient:
             try:
                 async for raw_message in ws:
                     self._last_message_ts = time.monotonic()
+                    LOGGER.debug("%s raw message: %s", self.name, raw_message)
                     try:
                         await self._handle_message(raw_message)
                     except Exception as exc:  # pragma: no cover - defensive path
@@ -267,6 +269,9 @@ class ReconnectingWebSocketClient:
     async def _connect(self) -> WebSocketClientProtocol:
         raise NotImplementedError
 
+    async def _after_connect(self, ws: WebSocketClientProtocol) -> None:
+        return None
+
     async def _send_subscription(self, ws: WebSocketClientProtocol) -> None:
         raise NotImplementedError
 
@@ -282,7 +287,7 @@ class ReconnectingWebSocketClient:
 class CapitalComClient(ReconnectingWebSocketClient):
 
     DEFAULT_REST_URL = "https://api-capital.backend-capital.com/api"
-    DEFAULT_STREAMING_URL = "wss://api-streaming-capital.com/connect"
+    DEFAULT_STREAMING_URL = "wss://api-streaming-capital.backend-capital.com/connect"
     DEMO_REST_URL = "https://demo-api-capital.com/api"
     DEMO_STREAMING_URL = "wss://demo-streaming-capital.com/connect"
 
@@ -326,13 +331,17 @@ class CapitalComClient(ReconnectingWebSocketClient):
             "CST": self._cst or "",
             "X-SECURITY-TOKEN": self._security_token or "",
         }
-        LOGGER.debug("Capital.com connecting with headers: %s", headers.keys())
+        LOGGER.debug("Capital.com connecting with headers: %s", list(headers.keys()))
         return await connect_websocket_compat(
             self._streaming_url,
             headers,
             ping_interval=20,
             ping_timeout=20,
+            subprotocols=("v11.stomp", "v10.stomp"),
         )
+
+    async def _after_connect(self, ws: WebSocketClientProtocol) -> None:
+        await self._perform_stomp_handshake(ws)
 
     async def _authenticate(self) -> None:
         async with self._auth_lock:
@@ -424,22 +433,79 @@ class CapitalComClient(ReconnectingWebSocketClient):
             if not self._tokens_are_valid():
                 raise RuntimeError(last_error or "Capital.com authentication failed")
 
+    async def _perform_stomp_handshake(self, ws: WebSocketClientProtocol) -> None:
+        headers = {
+            "accept-version": "1.1",
+            "heart-beat": "10000,10000",
+            "CST": self._cst or "",
+            "X-SECURITY-TOKEN": self._security_token or "",
+        }
+        frame = build_stomp_frame("CONNECT", headers)
+        await ws.send(frame)
+
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                command, resp_headers, body = parse_stomp_frame(raw)
+                if not command and not body:
+                    continue
+                if command == "CONNECTED":
+                    LOGGER.info(
+                        "Capital.com STOMP handshake complete (session=%s)",
+                        resp_headers.get("session", "unknown"),
+                    )
+                    return
+                if command == "ERROR":
+                    raise RuntimeError(f"Capital.com STOMP error: {body or resp_headers}")
+                LOGGER.debug("Capital.com handshake ignoring frame %s", command)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Capital.com STOMP CONNECTED frame timeout") from exc
+
     async def _send_subscription(self, ws: WebSocketClientProtocol) -> None:
         if not websocket_is_open(ws):
             raise RuntimeError("Capital.com WebSocket not open during subscription")
-        for mapping in self._mappings:
-            subscribe_message = {
+        for idx, mapping in enumerate(self._mappings, start=1):
+            headers = {
                 "destination": f"market:{mapping.capital_epic}",
-                "command": "subscribe",
+                "id": f"market-{idx}",
+                "ack": "auto",
             }
-            await ws.send(json.dumps(subscribe_message))
+            frame = build_stomp_frame("SUBSCRIBE", headers)
+            await ws.send(frame)
             LOGGER.info("Capital.com subscribed to %s", mapping.capital_epic)
 
     async def _handle_message(self, raw_message: str) -> None:
-        message = json.loads(raw_message)
+        command, headers, body_text = parse_stomp_frame(raw_message)
 
-        if "heartbeat" in message:
-            LOGGER.debug("Capital.com heartbeat: %s", message)
+        if not command and not body_text:
+            return
+
+        if command == "CONNECTED":
+            LOGGER.info(
+                "Capital.com STOMP connected (session=%s)", headers.get("session", "unknown")
+            )
+            return
+
+        if command == "ERROR":
+            LOGGER.error("Capital.com STOMP error: %s", body_text or headers)
+            return
+
+        if command == "RECEIPT":
+            LOGGER.debug("Capital.com receipt: %s", headers)
+            return
+
+        if command != "MESSAGE":
+            LOGGER.debug("Capital.com ignoring frame %s: %s", command, headers)
+            return
+
+        if not body_text:
+            LOGGER.debug("Capital.com message without body: %s", headers)
+            return
+
+        try:
+            message = json.loads(body_text)
+        except json.JSONDecodeError:
+            LOGGER.debug("Capital.com non-JSON body: %s", body_text)
             return
 
         body = message.get("body") or {}
@@ -686,6 +752,47 @@ def _maybe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def build_stomp_frame(command: str, headers: Dict[str, Any], body: Optional[str] = None) -> str:
+    lines = [command]
+    for key, value in headers.items():
+        if value is None:
+            continue
+        lines.append(f"{key}:{value}")
+    lines.append("")
+    body_text = "" if body is None else str(body)
+    lines.append(body_text)
+    return "\n".join(lines) + "\x00"
+
+
+def parse_stomp_frame(message: str) -> Tuple[str, Dict[str, str], str]:
+    if message is None:
+        return "", {}, ""
+
+    if message in ("\n", "\r\n"):
+        return "", {}, ""
+
+    text = message.replace("\r\n", "\n").rstrip("\x00")
+    if not text:
+        return "", {}, ""
+
+    lines = text.split("\n")
+    command = lines[0].strip()
+    headers: Dict[str, str] = {}
+    idx = 1
+    while idx < len(lines) and lines[idx] != "":
+        line = lines[idx]
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip()] = value.strip()
+        idx += 1
+
+    if idx < len(lines) and lines[idx] == "":
+        idx += 1
+
+    body = "\n".join(lines[idx:]) if idx < len(lines) else ""
+    return command, headers, body
 
 
 async def connect_websocket_compat(
